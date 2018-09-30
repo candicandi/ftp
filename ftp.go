@@ -33,9 +33,11 @@ type ServerConn struct {
 	// Timezone that the server is in
 	Location *time.Location
 
+	originConn    net.Conn
 	conn          *textproto.Conn
 	host          string
 	timeout       time.Duration
+	opsTimeout    time.Duration
 	features      map[string]string
 	mlstSupported bool
 }
@@ -82,13 +84,16 @@ func DialTimeout(addr string, timeout time.Duration) (*ServerConn, error) {
 	conn := textproto.NewConn(tconn)
 
 	c := &ServerConn{
-		conn:     conn,
-		host:     remoteAddr.IP.String(),
-		timeout:  timeout,
-		features: make(map[string]string),
-		Location: time.UTC,
+		originConn: tconn,
+		conn:       conn,
+		host:       remoteAddr.IP.String(),
+		timeout:    timeout,
+		opsTimeout: 0,
+		features:   make(map[string]string),
+		Location:   time.UTC,
 	}
 
+	c.setTimeout()
 	_, _, err = c.conn.ReadResponse(StatusReady)
 	if err != nil {
 		c.Quit()
@@ -140,6 +145,10 @@ func (c *ServerConn) Login(user, password string) error {
 	return err
 }
 
+func (c *ServerConn) SetOpsTimeout(timeout time.Duration) {
+	c.opsTimeout = timeout
+}
+
 // feat issues a FEAT FTP command to list the additional commands supported by
 // the remote FTP server.
 // FEAT is described in RFC 2389
@@ -188,10 +197,10 @@ func (c *ServerConn) setUTF8() error {
 		return err
 	}
 
-        // Workaround for FTP servers, that does not support this option.
-        if code == StatusBadArguments {
-                return nil
-        }
+	// Workaround for FTP servers, that does not support this option.
+	if code == StatusBadArguments {
+		return nil
+	}
 
 	// The ftpd "filezilla-server" has FEAT support for UTF8, but always returns
 	// "202 UTF8 mode is always enabled. No need to send this command." when
@@ -293,14 +302,22 @@ func (c *ServerConn) openDataConn() (net.Conn, error) {
 	return net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), c.timeout)
 }
 
+func (c *ServerConn) setTimeout() {
+	if c.opsTimeout > 0 {
+		c.originConn.SetDeadline(time.Now().Add(c.opsTimeout))
+	}
+}
+
 // cmd is a helper function to execute a command and check for the expected FTP
 // return code
 func (c *ServerConn) cmd(expected int, format string, args ...interface{}) (int, string, error) {
+	c.setTimeout()
 	_, err := c.conn.Cmd(format, args...)
 	if err != nil {
 		return 0, "", err
 	}
 
+	c.setTimeout()
 	return c.conn.ReadResponse(expected)
 }
 
@@ -320,12 +337,14 @@ func (c *ServerConn) cmdDataConnFrom(offset uint64, format string, args ...inter
 		}
 	}
 
+	c.setTimeout()
 	_, err = c.conn.Cmd(format, args...)
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
 
+	c.setTimeout()
 	code, msg, err := c.conn.ReadResponse(-1)
 	if err != nil {
 		conn.Close()
@@ -477,12 +496,14 @@ func (c *ServerConn) StorFrom(path string, r io.Reader, offset uint64) error {
 		return err
 	}
 
+	c.setTimeout()
 	_, err = io.Copy(conn, r)
 	conn.Close()
 	if err != nil {
 		return err
 	}
 
+	c.setTimeout()
 	_, _, err = c.conn.ReadResponse(StatusClosingDataConnection)
 	return err
 }
@@ -571,6 +592,7 @@ func (c *ServerConn) Logout() error {
 // Quit issues a QUIT FTP command to properly close the connection from the
 // remote FTP server.
 func (c *ServerConn) Quit() error {
+	c.setTimeout()
 	c.conn.Cmd("QUIT")
 	return c.conn.Close()
 }
@@ -586,6 +608,7 @@ func (r *Response) Close() error {
 	if r.closed {
 		return nil
 	}
+
 	err := r.conn.Close()
 	_, _, err2 := r.c.conn.ReadResponse(StatusClosingDataConnection)
 	if err2 != nil {
